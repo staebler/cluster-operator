@@ -24,7 +24,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/util/uuid"
+	"k8s.io/apimachinery/pkg/types"
 	clientgofake "k8s.io/client-go/kubernetes/fake"
 	clientgotesting "k8s.io/client-go/testing"
 	"k8s.io/client-go/tools/cache"
@@ -33,6 +33,12 @@ import (
 	clusteroperatorclientset "github.com/openshift/cluster-operator/pkg/client/clientset_generated/clientset/fake"
 	informers "github.com/openshift/cluster-operator/pkg/client/informers_generated/externalversions"
 	"github.com/openshift/cluster-operator/pkg/controller"
+)
+
+const (
+	testNamespace   = "test-namespace"
+	testClusterName = "test-cluster"
+	testClusterUUID = types.UID("test-cluster-uuid")
 )
 
 func newTestClusterController() (
@@ -101,28 +107,31 @@ func getKey(cluster *clusteroperator.Cluster, t *testing.T) string {
 }
 
 func newCluster(computeNames ...string) *clusteroperator.Cluster {
-	cluster := &clusteroperator.Cluster{
-		//TypeMeta: metav1.TypeMeta{APIVersion: api.Registry.GroupOrDie(v1.GroupName).GroupVersion.String()},
-		ObjectMeta: metav1.ObjectMeta{
-			UID:       uuid.NewUUID(),
-			Name:      "cluster1",
-			Namespace: metav1.NamespaceDefault,
-			//ResourceVersion: "18",
-		},
-		Spec: clusteroperator.ClusterSpec{
-			MasterNodeGroup: clusteroperator.ClusterNodeGroup{
-				Size: 1,
-			},
-			ComputeNodeGroups: make([]clusteroperator.ClusterComputeNodeGroup, len(computeNames)),
-		},
-	}
-	for i, name := range computeNames {
-		cluster.Spec.ComputeNodeGroups[i] = clusteroperator.ClusterComputeNodeGroup{
+	computes := make([]clusteroperator.ClusterComputeNodeGroup, len(computeNames))
+	for i, computeName := range computeNames {
+		computes[i] = clusteroperator.ClusterComputeNodeGroup{
+			Name: computeName,
 			ClusterNodeGroup: clusteroperator.ClusterNodeGroup{
 				Size: 1,
 			},
-			Name: name,
 		}
+	}
+	return newClusterWithSizes(1, computes...)
+}
+
+func newClusterWithSizes(masterSize int, computes ...clusteroperator.ClusterComputeNodeGroup) *clusteroperator.Cluster {
+	cluster := &clusteroperator.Cluster{
+		ObjectMeta: metav1.ObjectMeta{
+			UID:       testClusterUUID,
+			Name:      testClusterName,
+			Namespace: testNamespace,
+		},
+		Spec: clusteroperator.ClusterSpec{
+			MasterNodeGroup: clusteroperator.ClusterNodeGroup{
+				Size: masterSize,
+			},
+			ComputeNodeGroups: computes,
+		},
 	}
 	return cluster
 }
@@ -130,9 +139,9 @@ func newCluster(computeNames ...string) *clusteroperator.Cluster {
 func newNodeGroup(name string, cluster *clusteroperator.Cluster, properlyOwned bool) *clusteroperator.NodeGroup {
 	var controllerReference metav1.OwnerReference
 	if properlyOwned {
-		var trueVar = true
+		trueVar := true
 		controllerReference = metav1.OwnerReference{
-			UID:        cluster.UID,
+			UID:        testClusterUUID,
 			APIVersion: clusteroperator.SchemeGroupVersion.String(),
 			Kind:       "Cluster",
 			Name:       cluster.Name,
@@ -149,19 +158,38 @@ func newNodeGroup(name string, cluster *clusteroperator.Cluster, properlyOwned b
 }
 
 func newNodeGroups(store cache.Store, cluster *clusteroperator.Cluster, includeMaster bool, computeNames ...string) []*clusteroperator.NodeGroup {
-	nodeGroups := []*clusteroperator.NodeGroup{}
+	masterSize := 0
 	if includeMaster {
+		masterSize = 1
+	}
+
+	computes := make([]clusteroperator.ClusterComputeNodeGroup, len(computeNames))
+	for i, computeName := range computeNames {
+		computes[i] = clusteroperator.ClusterComputeNodeGroup{
+			ClusterNodeGroup: clusteroperator.ClusterNodeGroup{
+				Size: 1,
+			},
+			Name: computeName,
+		}
+	}
+
+	return newNodeGroupsWithSizes(store, cluster, masterSize, computes...)
+}
+
+func newNodeGroupsWithSizes(store cache.Store, cluster *clusteroperator.Cluster, masterSize int, computes ...clusteroperator.ClusterComputeNodeGroup) []*clusteroperator.NodeGroup {
+	nodeGroups := []*clusteroperator.NodeGroup{}
+	if masterSize > 0 {
 		name := fmt.Sprintf("%s-master-random", cluster.Name)
 		nodeGroup := newNodeGroup(name, cluster, true)
 		nodeGroup.Spec.NodeType = clusteroperator.NodeTypeMaster
-		nodeGroup.Spec.Size = 1
+		nodeGroup.Spec.Size = masterSize
 		nodeGroups = append(nodeGroups, nodeGroup)
 	}
-	for _, clusterNodeGroupName := range computeNames {
-		name := fmt.Sprintf("%s-compute-%s-random", cluster.Name, clusterNodeGroupName)
+	for _, compute := range computes {
+		name := fmt.Sprintf("%s-compute-%s-random", cluster.Name, compute.Name)
 		nodeGroup := newNodeGroup(name, cluster, true)
 		nodeGroup.Spec.NodeType = clusteroperator.NodeTypeCompute
-		nodeGroup.Spec.Size = 1
+		nodeGroup.Spec.Size = compute.Size
 		nodeGroups = append(nodeGroups, nodeGroup)
 	}
 	if store != nil {
@@ -170,6 +198,7 @@ func newNodeGroups(store cache.Store, cluster *clusteroperator.Cluster, includeM
 		}
 	}
 	return nodeGroups
+
 }
 
 // processSync initiates a sync via processNextWorkItem() to test behavior that
@@ -193,7 +222,7 @@ func processSync(c *ClusterController, key string) error {
 func validateClientActions(t *testing.T, clusterOperatorClient *clusteroperatorclientset.Clientset, expectedActions ...expectedClientAction) {
 	actualActions := clusterOperatorClient.Actions()
 	if e, a := len(expectedActions), len(actualActions); e != a {
-		t.Fatalf("unexpected number of client actions: expected %v, got %v", e, a)
+		t.Errorf("unexpected number of client actions: expected %v, got %v", e, a)
 	}
 	expectedActionSatisfied := make([]bool, len(expectedActions))
 	for _, actualAction := range actualActions {
@@ -241,12 +270,14 @@ func (ea expectedNodeGroupCreateAction) verb() string {
 func (ea expectedNodeGroupCreateAction) validate(t *testing.T, action clientgotesting.Action) bool {
 	createAction, ok := action.(clientgotesting.CreateAction)
 	if !ok {
-		t.Fatalf("create action is not a CreateAction: %t", createAction)
+		t.Errorf("create action is not a CreateAction: %t", createAction)
+		return false
 	}
 	createdObject := createAction.GetObject()
 	nodeGroup, ok := createdObject.(*clusteroperator.NodeGroup)
 	if !ok {
-		t.Fatalf("node group create action object is not a NodeGroup: %t", nodeGroup)
+		t.Errorf("node group create action object is not a NodeGroup: %t", nodeGroup)
+		return false
 	}
 	return nodeGroup.GenerateName == ea.namePrefix
 }
@@ -259,6 +290,39 @@ func newExpectedMasterNodeGroupCreateAction(cluster *clusteroperator.Cluster) ex
 
 func newExpectedComputeNodeGroupCreateAction(cluster *clusteroperator.Cluster, computeName string) expectedNodeGroupCreateAction {
 	return expectedNodeGroupCreateAction{
+		namePrefix: getNamePrefixForComputeNodeGroup(cluster, computeName),
+	}
+}
+
+type expectedNodeGroupDeleteAction struct {
+	namePrefix string
+}
+
+func (ea expectedNodeGroupDeleteAction) resource() schema.GroupVersionResource {
+	return clusteroperator.SchemeGroupVersion.WithResource("nodegroups")
+}
+
+func (ea expectedNodeGroupDeleteAction) verb() string {
+	return "delete"
+}
+
+func (ea expectedNodeGroupDeleteAction) validate(t *testing.T, action clientgotesting.Action) bool {
+	deleteAction, ok := action.(clientgotesting.DeleteAction)
+	if !ok {
+		t.Errorf("delete action is not a DeleteAction: %t", deleteAction)
+		return false
+	}
+	return strings.HasPrefix(deleteAction.GetName(), ea.namePrefix)
+}
+
+func newExpectedMasterNodeGroupDeleteAction(cluster *clusteroperator.Cluster) expectedNodeGroupDeleteAction {
+	return expectedNodeGroupDeleteAction{
+		namePrefix: getNamePrefixForMasterNodeGroup(cluster),
+	}
+}
+
+func newExpectedComputeNodeGroupDeleteAction(cluster *clusteroperator.Cluster, computeName string) expectedNodeGroupDeleteAction {
+	return expectedNodeGroupDeleteAction{
 		namePrefix: getNamePrefixForComputeNodeGroup(cluster, computeName),
 	}
 }
@@ -282,20 +346,42 @@ func (ea expectedClusterStatusUpdateAction) validate(t *testing.T, action client
 	}
 	updateAction, ok := action.(clientgotesting.UpdateAction)
 	if !ok {
-		t.Fatalf("update action is not an UpdateAction: %t", updateAction)
+		t.Errorf("update action is not an UpdateAction: %t", updateAction)
+		return false
 	}
 	updatedObject := updateAction.GetObject()
 	cluster, ok := updatedObject.(*clusteroperator.Cluster)
 	if !ok {
-		t.Fatalf("cluster status update action object is not a Cluster: %t", cluster)
+		t.Errorf("cluster status update action object is not a Cluster: %t", cluster)
+		return true
 	}
 	if e, a := ea.masterNodeGroups, cluster.Status.MasterNodeGroups; e != a {
-		t.Fatalf("unexpected masterNodeGroups in cluster update status: expected %v, got %v", e, a)
+		t.Errorf("unexpected masterNodeGroups in cluster update status: expected %v, got %v", e, a)
 	}
 	if e, a := ea.computeNodeGroups, cluster.Status.ComputeNodeGroups; e != a {
-		t.Fatalf("unexpected computeNodeGroups in cluster update status: expected %v, got %v", e, a)
+		t.Errorf("unexpected computeNodeGroups in cluster update status: expected %v, got %v", e, a)
 	}
 	return true
+}
+
+func validateControllerExpectations(t *testing.T, ctrlr *ClusterController, cluster *clusteroperator.Cluster, expectedAdds, expectedDeletes int) {
+	expectations, ok, err := ctrlr.expectations.GetExpectations(getKey(cluster, t))
+	switch {
+	case err != nil:
+		t.Errorf("error getting expecations: %v", cluster.GetName(), err)
+	case !ok:
+		if expectedAdds != 0 || expectedDeletes != 0 {
+			t.Errorf("no expectations found: expectedAdds %v, expectedDeletes %v", expectedAdds, expectedDeletes)
+		}
+	default:
+		actualsAdds, actualDeletes := expectations.GetExpectations()
+		if e, a := int64(expectedAdds), actualsAdds; e != a {
+			t.Errorf("unexpected number of adds in expectations: expected %v, got %v", e, a)
+		}
+		if e, a := int64(expectedDeletes), actualDeletes; e != a {
+			t.Errorf("unexpected number of deletes in expectations: expected %v, got %v", e, a)
+		}
+	}
 }
 
 func controllerResourceName() string {
@@ -337,6 +423,8 @@ func TestSyncClusterSteadyState(t *testing.T) {
 			controller.syncCluster(getKey(cluster, t))
 
 			validateClientActions(t, clusterOperatorClient)
+
+			validateControllerExpectations(t, controller, cluster, 0, 0)
 		})
 	}
 }
@@ -402,6 +490,8 @@ func TestSyncClusterCreateNodeGroups(t *testing.T) {
 			}
 
 			validateClientActions(t, clusterOperatorClient, expectedActions...)
+
+			validateControllerExpectations(t, controller, cluster, len(expectedActions), 0)
 		})
 	}
 }
@@ -456,8 +546,416 @@ func TestSyncClusterNodeGroupsAdded(t *testing.T) {
 			validateClientActions(t, clusterOperatorClient,
 				expectedClusterStatusUpdateAction{masterNodeGroups: 1, computeNodeGroups: len(tc.computes)},
 			)
+
+			validateControllerExpectations(t, controller, cluster, 0, 0)
 		})
 	}
+}
+
+func TestSyncClusterDeletedNodeGroups(t *testing.T) {
+	cases := []struct {
+		name             string
+		masterDeleted    bool
+		clusterComputes  []string
+		realizedComputes []string
+	}{
+		{
+			name:          "master",
+			masterDeleted: true,
+		},
+		{
+			name:            "single compute",
+			clusterComputes: []string{"compute1"},
+		},
+		{
+			name:            "multiple computes",
+			clusterComputes: []string{"compute1", "compute2"},
+		},
+		{
+			name:            "master and  computes",
+			masterDeleted:   true,
+			clusterComputes: []string{"compute1", "compute2"},
+		},
+		{
+			name:             "subset of computes",
+			clusterComputes:  []string{"compute1", "compute2", "compute3"},
+			realizedComputes: []string{"compute1", "compute2"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			controller, clusterStore, nodeGroupStore, _, clusterOperatorClient := newTestClusterController()
+
+			cluster := newCluster(tc.clusterComputes...)
+			cluster.Status.MasterNodeGroups = 1
+			cluster.Status.ComputeNodeGroups = len(tc.clusterComputes)
+			clusterStore.Add(cluster)
+			newNodeGroups(nodeGroupStore, cluster, !tc.masterDeleted, tc.realizedComputes...)
+
+			controller.syncCluster(getKey(cluster, t))
+
+			expectedActions := []expectedClientAction{}
+			if tc.masterDeleted {
+				expectedActions = append(expectedActions, newExpectedMasterNodeGroupCreateAction(cluster))
+			}
+			for _, clusterCompute := range tc.clusterComputes {
+				realized := false
+				for _, realizedCompute := range tc.realizedComputes {
+					if clusterCompute == realizedCompute {
+						realized = true
+						break
+					}
+				}
+				if !realized {
+					expectedActions = append(expectedActions, newExpectedComputeNodeGroupCreateAction(cluster, clusterCompute))
+				}
+			}
+			statusMasterNodeGroups := 1
+			if tc.masterDeleted {
+				statusMasterNodeGroups = 0
+			}
+			expectedActions = append(expectedActions, expectedClusterStatusUpdateAction{
+				masterNodeGroups:  statusMasterNodeGroups,
+				computeNodeGroups: len(tc.realizedComputes),
+			})
+
+			validateClientActions(t, clusterOperatorClient, expectedActions...)
+
+			validateControllerExpectations(t, controller, cluster, len(expectedActions)-1, 0)
+		})
+	}
+}
+
+func TestSyncClusterNodeGroupsRemoved(t *testing.T) {
+	cases := []struct {
+		name             string
+		clusterComputes  []string
+		realizedComputes []string
+	}{
+		{
+			name:             "single compute",
+			realizedComputes: []string{"compute1"},
+		},
+		{
+			name:             "multiple computes",
+			realizedComputes: []string{"compute1", "compute2"},
+		},
+		{
+			name:             "subset of computes",
+			clusterComputes:  []string{"compute1", "compute2"},
+			realizedComputes: []string{"compute1", "compute2", "compute3"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			controller, clusterStore, nodeGroupStore, _, clusterOperatorClient := newTestClusterController()
+
+			cluster := newCluster(tc.clusterComputes...)
+			cluster.Status.MasterNodeGroups = 1
+			cluster.Status.ComputeNodeGroups = len(tc.clusterComputes)
+			clusterStore.Add(cluster)
+			newNodeGroups(nodeGroupStore, cluster, true, tc.realizedComputes...)
+
+			controller.syncCluster(getKey(cluster, t))
+
+			expectedActions := []expectedClientAction{}
+			for _, realizedCompute := range tc.realizedComputes {
+				includedInCluster := false
+				for _, clusterCompute := range tc.clusterComputes {
+					if realizedCompute == clusterCompute {
+						includedInCluster = true
+						break
+					}
+				}
+				if !includedInCluster {
+					expectedActions = append(expectedActions, newExpectedComputeNodeGroupDeleteAction(cluster, realizedCompute))
+				}
+			}
+
+			validateClientActions(t, clusterOperatorClient, expectedActions...)
+
+			validateControllerExpectations(t, controller, cluster, 0, len(expectedActions))
+		})
+	}
+}
+
+func TestSyncClusterNodeGroupsMutated(t *testing.T) {
+	cases := []struct {
+		name                 string
+		clusterMasterSize    int
+		realizedMasterSize   int
+		clusterComputeSizes  []int
+		realizedComputeSizes []int
+	}{
+		{
+			name:               "master only",
+			clusterMasterSize:  1,
+			realizedMasterSize: 2,
+		},
+		{
+			name:                 "single compute",
+			clusterMasterSize:    1,
+			realizedMasterSize:   1,
+			clusterComputeSizes:  []int{1},
+			realizedComputeSizes: []int{2},
+		},
+		{
+			name:                 "multiple computes",
+			clusterMasterSize:    1,
+			realizedMasterSize:   1,
+			clusterComputeSizes:  []int{1, 2},
+			realizedComputeSizes: []int{2, 1},
+		},
+		{
+			name:                 "master and computes",
+			clusterMasterSize:    1,
+			realizedMasterSize:   2,
+			clusterComputeSizes:  []int{1, 2},
+			realizedComputeSizes: []int{2, 1},
+		},
+		{
+			name:                 "subset of computes",
+			clusterMasterSize:    1,
+			realizedMasterSize:   2,
+			clusterComputeSizes:  []int{1, 2, 3},
+			realizedComputeSizes: []int{2, 1, 3},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if a, b := len(tc.clusterComputeSizes), len(tc.realizedComputeSizes); a != b {
+				t.Skipf("clusterComputeSizes length must be equal to realizedComputeSizes length: %v, %v", a, b)
+			}
+
+			controller, clusterStore, nodeGroupStore, _, clusterOperatorClient := newTestClusterController()
+
+			clusterComputes := make([]clusteroperator.ClusterComputeNodeGroup, len(tc.clusterComputeSizes))
+			realizedComputes := make([]clusteroperator.ClusterComputeNodeGroup, len(tc.realizedComputeSizes))
+			for i := range tc.clusterComputeSizes {
+				name := fmt.Sprintf("compute%v", i)
+				clusterComputes[i] = clusteroperator.ClusterComputeNodeGroup{
+					ClusterNodeGroup: clusteroperator.ClusterNodeGroup{
+						Size: tc.clusterComputeSizes[i],
+					},
+					Name: name,
+				}
+				realizedComputes[i] = clusteroperator.ClusterComputeNodeGroup{
+					ClusterNodeGroup: clusteroperator.ClusterNodeGroup{
+						Size: tc.realizedComputeSizes[i],
+					},
+					Name: name,
+				}
+			}
+			cluster := newClusterWithSizes(tc.clusterMasterSize, clusterComputes...)
+			cluster.Status.MasterNodeGroups = 1
+			cluster.Status.ComputeNodeGroups = len(clusterComputes)
+			clusterStore.Add(cluster)
+			newNodeGroupsWithSizes(nodeGroupStore, cluster, tc.realizedMasterSize, realizedComputes...)
+
+			controller.syncCluster(getKey(cluster, t))
+
+			expectedActions := []expectedClientAction{}
+			if tc.clusterMasterSize != tc.realizedMasterSize {
+				expectedActions = append(expectedActions,
+					newExpectedMasterNodeGroupDeleteAction(cluster),
+					newExpectedMasterNodeGroupCreateAction(cluster),
+				)
+			}
+			for i, clusterCompute := range clusterComputes {
+				if clusterCompute.Size == tc.realizedComputeSizes[i] {
+					continue
+				}
+				expectedActions = append(expectedActions,
+					newExpectedComputeNodeGroupDeleteAction(cluster, clusterCompute.Name),
+					newExpectedComputeNodeGroupCreateAction(cluster, clusterCompute.Name),
+				)
+			}
+
+			validateClientActions(t, clusterOperatorClient, expectedActions...)
+
+			validateControllerExpectations(t, controller, cluster, len(expectedActions)/2, len(expectedActions)/2)
+		})
+	}
+}
+
+func TestSyncClusterNodeGroupOwnerReference(t *testing.T) {
+	trueVar := true
+	cases := []struct {
+		name            string
+		ownerRef        *metav1.OwnerReference
+		expectNewMaster bool
+	}{
+		{
+			name: "owned",
+			ownerRef: &metav1.OwnerReference{
+				UID:        testClusterUUID,
+				APIVersion: clusteroperator.SchemeGroupVersion.String(),
+				Kind:       "Cluster",
+				Controller: &trueVar,
+			},
+			expectNewMaster: false,
+		},
+		{
+			name:            "no owner",
+			expectNewMaster: true,
+		},
+		{
+			name: "different owner",
+			ownerRef: &metav1.OwnerReference{
+				UID:        types.UID("other-cluster-uuid"),
+				APIVersion: clusteroperator.SchemeGroupVersion.String(),
+				Kind:       "Cluster",
+				Controller: &trueVar,
+			},
+			expectNewMaster: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			controller, clusterStore, nodeGroupStore, _, clusterOperatorClient := newTestClusterController()
+
+			cluster := newCluster()
+			clusterStore.Add(cluster)
+
+			nodeGroupName := fmt.Sprintf("%s-master-random", cluster.Name)
+			nodeGroup := newNodeGroup(nodeGroupName, cluster, false)
+			nodeGroup.Spec.NodeType = clusteroperator.NodeTypeMaster
+			nodeGroup.Spec.Size = 1
+			if tc.ownerRef != nil {
+				nodeGroup.OwnerReferences = []metav1.OwnerReference{*tc.ownerRef}
+			}
+			nodeGroupStore.Add(nodeGroup)
+
+			controller.syncCluster(getKey(cluster, t))
+
+			expectedActions := []expectedClientAction{}
+			if tc.expectNewMaster {
+				expectedActions = append(expectedActions, newExpectedMasterNodeGroupCreateAction(cluster))
+			} else {
+				expectedActions = append(expectedActions, expectedClusterStatusUpdateAction{masterNodeGroups: 1})
+			}
+
+			validateClientActions(t, clusterOperatorClient, expectedActions...)
+
+			expectedAdds := 0
+			if tc.expectNewMaster {
+				expectedAdds = 1
+			}
+			validateControllerExpectations(t, controller, cluster, expectedAdds, 0)
+		})
+	}
+}
+
+func TestSyncClusterNodeGroupDeletionTimestamp(t *testing.T) {
+	cases := []struct {
+		name              string
+		deletionTimestamp *metav1.Time
+		expectNewMaster   bool
+	}{
+		{
+			name:              "not deleted",
+			deletionTimestamp: nil,
+			expectNewMaster:   false,
+		},
+		{
+			name:              "deleted",
+			deletionTimestamp: &metav1.Time{},
+			expectNewMaster:   true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			controller, clusterStore, nodeGroupStore, _, clusterOperatorClient := newTestClusterController()
+
+			cluster := newCluster()
+			clusterStore.Add(cluster)
+
+			nodeGroupName := fmt.Sprintf("%s-master-random", cluster.Name)
+			nodeGroup := newNodeGroup(nodeGroupName, cluster, true)
+			nodeGroup.Spec.NodeType = clusteroperator.NodeTypeMaster
+			nodeGroup.Spec.Size = 1
+			nodeGroup.DeletionTimestamp = tc.deletionTimestamp
+			nodeGroupStore.Add(nodeGroup)
+
+			controller.syncCluster(getKey(cluster, t))
+
+			expectedActions := []expectedClientAction{}
+			if tc.expectNewMaster {
+				expectedActions = append(expectedActions, newExpectedMasterNodeGroupCreateAction(cluster))
+			} else {
+				expectedActions = append(expectedActions, expectedClusterStatusUpdateAction{masterNodeGroups: 1})
+			}
+
+			validateClientActions(t, clusterOperatorClient, expectedActions...)
+
+			expectedAdds := 0
+			if tc.expectNewMaster {
+				expectedAdds = 1
+			}
+			validateControllerExpectations(t, controller, cluster, expectedAdds, 0)
+		})
+	}
+}
+
+func TestSyncClusterComplex(t *testing.T) {
+	controller, clusterStore, nodeGroupStore, _, clusterOperatorClient := newTestClusterController()
+
+	cluster := newClusterWithSizes(1,
+		clusteroperator.ClusterComputeNodeGroup{
+			ClusterNodeGroup: clusteroperator.ClusterNodeGroup{
+				Size: 1,
+			},
+			Name: "realized and un-mutated",
+		},
+		clusteroperator.ClusterComputeNodeGroup{
+			ClusterNodeGroup: clusteroperator.ClusterNodeGroup{
+				Size: 1,
+			},
+			Name: "realized but mutated",
+		},
+		clusteroperator.ClusterComputeNodeGroup{
+			ClusterNodeGroup: clusteroperator.ClusterNodeGroup{
+				Size: 1,
+			},
+			Name: "unrealized",
+		},
+	)
+	clusterStore.Add(cluster)
+
+	newNodeGroupsWithSizes(nodeGroupStore, cluster, 2,
+		clusteroperator.ClusterComputeNodeGroup{
+			ClusterNodeGroup: clusteroperator.ClusterNodeGroup{
+				Size: 1,
+			},
+			Name: "realized and un-mutated",
+		},
+		clusteroperator.ClusterComputeNodeGroup{
+			ClusterNodeGroup: clusteroperator.ClusterNodeGroup{
+				Size: 2,
+			},
+			Name: "realized but mutated",
+		},
+		clusteroperator.ClusterComputeNodeGroup{
+			ClusterNodeGroup: clusteroperator.ClusterNodeGroup{
+				Size: 1,
+			},
+			Name: "removed from cluster",
+		},
+	)
+
+	controller.syncCluster(getKey(cluster, t))
+
+	validateClientActions(t, clusterOperatorClient,
+		newExpectedMasterNodeGroupDeleteAction(cluster),
+		newExpectedMasterNodeGroupCreateAction(cluster),
+		newExpectedComputeNodeGroupDeleteAction(cluster, "realized but mutated"),
+		newExpectedComputeNodeGroupCreateAction(cluster, "realized but mutated"),
+		newExpectedComputeNodeGroupCreateAction(cluster, "unrealized"),
+		newExpectedComputeNodeGroupDeleteAction(cluster, "removed from cluster"),
+		expectedClusterStatusUpdateAction{masterNodeGroups: 1, computeNodeGroups: 2}, // status only counts the 2 realized compute nodes
+	)
+
+	validateControllerExpectations(t, controller, cluster, 3, 3)
 }
 
 //func TestPodControllerLookup(t *testing.T) {
@@ -831,155 +1329,6 @@ func TestSyncClusterNodeGroupsAdded(t *testing.T) {
 //	if gets != 1 || updates != 2 {
 //		t.Errorf("Expected 1 get and 2 updates, got %d gets %d updates", gets, updates)
 //	}
-//}
-
-//// TODO: This test is too hairy for a unittest. It should be moved to an E2E suite.
-//func doTestControllerBurstReplicas(t *testing.T, burstReplicas, numReplicas int) {
-//	labelMap := map[string]string{"foo": "bar"}
-//	rsSpec := newReplicaSet(numReplicas, labelMap)
-//	client := fake.NewSimpleClientset(rsSpec)
-//	fakePodControl := controller.FakePodControl{}
-//	stopCh := make(chan struct{})
-//	defer close(stopCh)
-//	manager, informers := testNewReplicaSetControllerFromClient(client, stopCh, burstReplicas)
-//	manager.podControl = &fakePodControl
-
-//	informers.Extensions().V1beta1().ReplicaSets().Informer().GetIndexer().Add(rsSpec)
-
-//	expectedPods := int32(0)
-//	pods := newPodList(nil, numReplicas, v1.PodPending, labelMap, rsSpec, "pod")
-
-//	rsKey, err := controller.KeyFunc(rsSpec)
-//	if err != nil {
-//		t.Errorf("Couldn't get key for object %#v: %v", rsSpec, err)
-//	}
-
-//	// Size up the controller, then size it down, and confirm the expected create/delete pattern
-//	for _, replicas := range []int32{int32(numReplicas), 0} {
-
-//		*(rsSpec.Spec.Replicas) = replicas
-//		informers.Extensions().V1beta1().ReplicaSets().Informer().GetIndexer().Add(rsSpec)
-
-//		for i := 0; i < numReplicas; i += burstReplicas {
-//			manager.syncReplicaSet(getKey(rsSpec, t))
-
-//			// The store accrues active pods. It's also used by the ReplicaSet to determine how many
-//			// replicas to create.
-//			activePods := int32(len(informers.Core().V1().Pods().Informer().GetIndexer().List()))
-//			if replicas != 0 {
-//				// This is the number of pods currently "in flight". They were created by the
-//				// ReplicaSet controller above, which then puts the ReplicaSet to sleep till
-//				// all of them have been observed.
-//				expectedPods = replicas - activePods
-//				if expectedPods > int32(burstReplicas) {
-//					expectedPods = int32(burstReplicas)
-//				}
-//				// This validates the ReplicaSet manager sync actually created pods
-//				validateSyncReplicaSet(t, &fakePodControl, int(expectedPods), 0, 0)
-
-//				// This simulates the watch events for all but 1 of the expected pods.
-//				// None of these should wake the controller because it has expectations==BurstReplicas.
-//				for i := int32(0); i < expectedPods-1; i++ {
-//					informers.Core().V1().Pods().Informer().GetIndexer().Add(&pods.Items[i])
-//					manager.addPod(&pods.Items[i])
-//				}
-
-//				podExp, exists, err := manager.expectations.GetExpectations(rsKey)
-//				if !exists || err != nil {
-//					t.Fatalf("Did not find expectations for rs.")
-//				}
-//				if add, _ := podExp.GetExpectations(); add != 1 {
-//					t.Fatalf("Expectations are wrong %v", podExp)
-//				}
-//			} else {
-//				expectedPods = (replicas - activePods) * -1
-//				if expectedPods > int32(burstReplicas) {
-//					expectedPods = int32(burstReplicas)
-//				}
-//				validateSyncReplicaSet(t, &fakePodControl, 0, int(expectedPods), 0)
-
-//				// To accurately simulate a watch we must delete the exact pods
-//				// the rs is waiting for.
-//				expectedDels := manager.expectations.GetUIDs(getKey(rsSpec, t))
-//				podsToDelete := []*v1.Pod{}
-//				isController := true
-//				for _, key := range expectedDels.List() {
-//					nsName := strings.Split(key, "/")
-//					podsToDelete = append(podsToDelete, &v1.Pod{
-//						ObjectMeta: metav1.ObjectMeta{
-//							Name:      nsName[1],
-//							Namespace: nsName[0],
-//							Labels:    rsSpec.Spec.Selector.MatchLabels,
-//							OwnerReferences: []metav1.OwnerReference{
-//								{UID: rsSpec.UID, APIVersion: "v1", Kind: "ReplicaSet", Name: rsSpec.Name, Controller: &isController},
-//							},
-//						},
-//					})
-//				}
-//				// Don't delete all pods because we confirm that the last pod
-//				// has exactly one expectation at the end, to verify that we
-//				// don't double delete.
-//				for i := range podsToDelete[1:] {
-//					informers.Core().V1().Pods().Informer().GetIndexer().Delete(podsToDelete[i])
-//					manager.deletePod(podsToDelete[i])
-//				}
-//				podExp, exists, err := manager.expectations.GetExpectations(rsKey)
-//				if !exists || err != nil {
-//					t.Fatalf("Did not find expectations for ReplicaSet.")
-//				}
-//				if _, del := podExp.GetExpectations(); del != 1 {
-//					t.Fatalf("Expectations are wrong %v", podExp)
-//				}
-//			}
-
-//			// Check that the ReplicaSet didn't take any action for all the above pods
-//			fakePodControl.Clear()
-//			manager.syncReplicaSet(getKey(rsSpec, t))
-//			validateSyncReplicaSet(t, &fakePodControl, 0, 0, 0)
-
-//			// Create/Delete the last pod
-//			// The last add pod will decrease the expectation of the ReplicaSet to 0,
-//			// which will cause it to create/delete the remaining replicas up to burstReplicas.
-//			if replicas != 0 {
-//				informers.Core().V1().Pods().Informer().GetIndexer().Add(&pods.Items[expectedPods-1])
-//				manager.addPod(&pods.Items[expectedPods-1])
-//			} else {
-//				expectedDel := manager.expectations.GetUIDs(getKey(rsSpec, t))
-//				if expectedDel.Len() != 1 {
-//					t.Fatalf("Waiting on unexpected number of deletes.")
-//				}
-//				nsName := strings.Split(expectedDel.List()[0], "/")
-//				isController := true
-//				lastPod := &v1.Pod{
-//					ObjectMeta: metav1.ObjectMeta{
-//						Name:      nsName[1],
-//						Namespace: nsName[0],
-//						Labels:    rsSpec.Spec.Selector.MatchLabels,
-//						OwnerReferences: []metav1.OwnerReference{
-//							{UID: rsSpec.UID, APIVersion: "v1", Kind: "ReplicaSet", Name: rsSpec.Name, Controller: &isController},
-//						},
-//					},
-//				}
-//				informers.Core().V1().Pods().Informer().GetIndexer().Delete(lastPod)
-//				manager.deletePod(lastPod)
-//			}
-//			pods.Items = pods.Items[expectedPods:]
-//		}
-
-//		// Confirm that we've created the right number of replicas
-//		activePods := int32(len(informers.Core().V1().Pods().Informer().GetIndexer().List()))
-//		if activePods != *(rsSpec.Spec.Replicas) {
-//			t.Fatalf("Unexpected number of active pods, expected %d, got %d", *(rsSpec.Spec.Replicas), activePods)
-//		}
-//		// Replenish the pod list, since we cut it down sizing up
-//		pods = newPodList(nil, int(replicas), v1.PodRunning, labelMap, rsSpec, "pod")
-//	}
-//}
-
-//func TestControllerBurstReplicas(t *testing.T) {
-//	doTestControllerBurstReplicas(t, 5, 30)
-//	doTestControllerBurstReplicas(t, 5, 12)
-//	doTestControllerBurstReplicas(t, 3, 2)
 //}
 
 //type FakeRSExpectations struct {

@@ -459,8 +459,16 @@ func (c *ClusterController) manageNodeGroups(nodeGroups []*clusteroperator.NodeG
 		}
 	}
 
+	// Snapshot the UIDs (ns/name) of the node groups we're expecting to see
+	// deleted, so we know to record their expectations exactly once either
+	// when we see it as an update of the deletion timestamp, or as a delete.
+	deletedNodeGroupKeys := make([]string, len(nodeGroupsToDelete))
+	for i, ng := range nodeGroupsToDelete {
+		deletedNodeGroupKeys[i] = getNodeGroupKey(ng)
+	}
+	c.expectations.SetExpectations(clusterKey, len(nodeGroupsToCreate), deletedNodeGroupKeys)
+
 	if len(nodeGroupsToCreate) > 0 {
-		c.expectations.ExpectCreations(clusterKey, len(nodeGroupsToCreate))
 		var wg sync.WaitGroup
 		glog.V(2).Infof("Creating %d new node groups for cluster %q/%q", len(nodeGroupsToCreate), cluster.Namespace, cluster.Name)
 		wg.Add(len(nodeGroupsToCreate))
@@ -490,14 +498,6 @@ func (c *ClusterController) manageNodeGroups(nodeGroups []*clusteroperator.NodeG
 	}
 
 	if len(nodeGroupsToDelete) > 0 {
-		// Snapshot the UIDs (ns/name) of the node groups we're expecting to see
-		// deleted, so we know to record their expectations exactly once either
-		// when we see it as an update of the deletion timestamp, or as a delete.
-		deletedNodeGroupKeys := make([]string, len(nodeGroupsToDelete))
-		for i, ng := range nodeGroupsToDelete {
-			deletedNodeGroupKeys[i] = getNodeGroupKey(ng)
-		}
-		c.expectations.ExpectDeletions(clusterKey, deletedNodeGroupKeys)
 		var wg sync.WaitGroup
 		wg.Add(len(nodeGroupsToDelete))
 		for i, ng := range nodeGroupsToDelete {

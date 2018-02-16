@@ -140,8 +140,21 @@ func (s *jobSync) Sync(key string) error {
 	}
 
 	switch jobControlResult {
+	case JobControlJobSucceeded:
+		return s.setOwnerStatusForCompletedJob(
+			owner,
+			deleting,
+			ReasonJobCompleted,
+			"Job completed",
+		)
 	case JobControlJobWorking:
-		return s.syncOwnerStatusWithJob(owner, job, deleting)
+		return s.setOwnerStatusForInProgressJob(
+			owner,
+			job,
+			deleting,
+			ReasonJobRunning,
+			"Job running",
+		)
 	case JobControlDeletingJobs:
 		if currentJobName == "" {
 			return nil
@@ -156,7 +169,7 @@ func (s *jobSync) Sync(key string) error {
 			return s.addFinalizer(owner)
 		}
 		return nil
-	case JobControlPendingExpectations, JobControlNoWork:
+	case JobControlPendingExpectations, JobControlNoWork, JobControlJobFailed:
 		return nil
 	default:
 		return fmt.Errorf("unknown job control result: %v", jobControlResult)
@@ -178,48 +191,6 @@ func (s *jobSync) setOwnerStatusForOutdatedJob(original metav1.Object) error {
 	)
 	s.strategy.SetOwnerCurrentJob(owner, "")
 	return s.strategy.UpdateOwnerStatus(original, owner)
-}
-
-// syncOwnerStatusWithJob update the status of the owner to
-// reflect the current status of the job that is processing the owner.
-// If the job completed successfully, the owner will be marked as
-// processed.
-// If the job completed with a failure, the owner will be marked as
-// not processed.
-// If the job is still in progress, the owner will be marked as
-// processing.
-func (s *jobSync) syncOwnerStatusWithJob(owner metav1.Object, job *v1batch.Job, deleting bool) error {
-	if job == nil {
-		return fmt.Errorf("job control result was that a job was working, but no job was returned")
-	}
-
-	jobCompleted := findJobCondition(job, v1batch.JobComplete)
-	if jobCompleted != nil && jobCompleted.Status == kapi.ConditionTrue {
-		return s.setOwnerStatusForCompletedJob(
-			owner,
-			deleting,
-			ReasonJobCompleted,
-			fmt.Sprintf("Job %s/%s completed at %v", job.Namespace, job.Name, jobCompleted.LastTransitionTime),
-		)
-	}
-
-	jobFailed := findJobCondition(job, v1batch.JobFailed)
-	if jobFailed != nil && jobFailed.Status == kapi.ConditionTrue {
-		return s.setOwnerStatusForFailedJob(
-			owner,
-			deleting,
-			ReasonJobFailed,
-			fmt.Sprintf("Job %s/%s failed at %v, reason: %s", job.Namespace, job.Name, jobFailed.LastTransitionTime, jobFailed.Reason),
-		)
-	}
-
-	return s.setOwnerStatusForInProgressJob(
-		owner,
-		job,
-		deleting,
-		ReasonJobRunning,
-		fmt.Sprintf("Job %s/%s is running since %v. Pod completions: %d, failures: %d", job.Namespace, job.Name, job.Status.StartTime, job.Status.Succeeded, job.Status.Failed),
-	)
 }
 
 func (s *jobSync) setOwnerStatusForLostJob(owner metav1.Object, deleting bool) error {
@@ -311,15 +282,4 @@ func (s *jobSync) getFinalizerName() string {
 		finalizerName = finalizerName + "1"
 	}
 	return finalizerName
-}
-
-// findJobCondition finds in the job the condition that has the
-// specified condition type. If none exists, then returns nil.
-func findJobCondition(job *v1batch.Job, conditionType v1batch.JobConditionType) *v1batch.JobCondition {
-	for i, condition := range job.Status.Conditions {
-		if condition.Type == conditionType {
-			return &job.Status.Conditions[i]
-		}
-	}
-	return nil
 }
